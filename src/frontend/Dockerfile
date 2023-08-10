@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.20.7-alpine@sha256:29a2b239b10daa321685e58dd58ca7f5e04639f7fc99ba5af84975e2796b7cd7 as builder
+FROM arm64v8/golang:1.20.7-alpine as builder
 RUN apk add --no-cache ca-certificates git
 RUN apk add build-base
 WORKDIR /src
