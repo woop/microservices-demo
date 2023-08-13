@@ -1,22 +1,9 @@
-// Copyright 2018 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package main
 
 import (
-	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -31,7 +18,6 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"cloud.google.com/go/profiler"
-	"github.com/golang/protobuf/jsonpb"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -40,6 +26,8 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"google.golang.org/grpc"
+
+	"github.com/lib/pq"
 )
 
 var (
@@ -48,8 +36,6 @@ var (
 	extraLatency time.Duration
 
 	port = "3550"
-
-	reloadCatalog bool
 )
 
 func init() {
@@ -104,24 +90,168 @@ func main() {
 			sig := <-sigs
 			log.Printf("Received signal: %s", sig)
 			if sig == syscall.SIGUSR1 {
-				reloadCatalog = true
 				log.Infof("Enable catalog reloading")
 			} else {
-				reloadCatalog = false
 				log.Infof("Disable catalog reloading")
 			}
 		}
 	}()
 
+	// Init database
+	initDatabase()
+
+	// Load initial data
+	var err error
+	var db *sql.DB
+	db, err = sql.Open("postgres", fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		os.Getenv("POSTGRES_HOST"),
+		os.Getenv("POSTGRES_PORT"),
+		os.Getenv("POSTGRES_USER"),
+		os.Getenv("POSTGRES_PASSWORD"),
+		os.Getenv("POSTGRES_DB"),
+	))
+
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	err = loadData(db)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Start gRPC server
 	if os.Getenv("PORT") != "" {
 		port = os.Getenv("PORT")
 	}
 	log.Infof("starting grpc server at :%s", port)
-	run(port)
+	run(port, db)
 	select {}
 }
 
-func run(port string) string {
+type Product struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Picture     string `json:"picture"`
+	PriceUsd    struct {
+		CurrencyCode string `json:"currencyCode"`
+		Units        int    `json:"units"`
+		Nanos        int    `json:"nanos"`
+	} `json:"priceUsd"`
+	Categories []string `json:"categories"`
+}
+
+type Products struct {
+	Products []Product `json:"products"`
+}
+
+func initDatabase() {
+	start := time.Now()
+	for {
+		if time.Since(start) > time.Minute {
+			fmt.Println("Failed to load data after 1 minute. Exiting.")
+			os.Exit(1)
+		}
+
+		pgdb, err := sql.Open("postgres", fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=postgres sslmode=disable",
+			os.Getenv("POSTGRES_HOST"),
+			os.Getenv("POSTGRES_PORT"),
+			os.Getenv("POSTGRES_USER"),
+			os.Getenv("POSTGRES_PASSWORD"),
+		))
+
+		if err != nil {
+			fmt.Println(err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		dbname := os.Getenv("POSTGRES_DB")
+		err = createDatabase(pgdb, dbname)
+
+		if err != nil {
+			fmt.Println(err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		pgdb.Close()
+		break
+	}
+}
+
+func loadData(db *sql.DB) error {
+
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS products (
+		id TEXT PRIMARY KEY,
+		name TEXT,
+		description TEXT,
+		picture TEXT,
+		price_currency TEXT,
+		price_units INT,
+		price_nanos INT,
+		categories TEXT[]
+	)`)
+
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`TRUNCATE TABLE products;`)
+
+	if err != nil {
+		return err
+	}
+
+	productCatalogFile := "products.json"
+	if os.Getenv("PRODUCT_CATALOG_FILE") != "" {
+		productCatalogFile = os.Getenv("PRODUCT_CATALOG_FILE")
+	}
+
+	data, err := ioutil.ReadFile(productCatalogFile)
+
+	if err != nil {
+		return err
+	}
+
+	var products Products
+	err = json.Unmarshal(data, &products)
+
+	if err != nil {
+		return err
+	}
+	var rowsInserted int64 = 0
+
+	for _, product := range products.Products {
+		result, err := db.Exec(`INSERT INTO products (id, name, description, picture, price_currency, price_units, price_nanos, categories) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			product.ID,
+			product.Name,
+			product.Description,
+			product.Picture,
+			product.PriceUsd.CurrencyCode,
+			product.PriceUsd.Units,
+			product.PriceUsd.Nanos,
+			pq.Array(product.Categories),
+		)
+		if err != nil {
+			return err
+		}
+
+		rowsAffected, err := result.RowsAffected()
+
+		if err != nil {
+			return err
+		}
+
+		rowsInserted += rowsAffected
+	}
+
+	fmt.Printf("Inserted %d rows into the products table.\n", rowsInserted)
+	return nil
+}
+
+func run(port string, db *sql.DB) string {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		log.Fatal(err)
@@ -136,10 +266,8 @@ func run(port string) string {
 		grpc.UnaryInterceptor(otelgrpc.UnaryServerInterceptor()),
 		grpc.StreamInterceptor(otelgrpc.StreamServerInterceptor()))
 
-	svc := &productCatalog{}
-	err = readCatalogFile(&svc.catalog)
-	if err != nil {
-		log.Warnf("could not parse product catalog")
+	svc := &productCatalog{
+		db: db,
 	}
 
 	pb.RegisterProductCatalogServiceServer(srv, svc)
@@ -147,10 +275,6 @@ func run(port string) string {
 	go srv.Serve(listener)
 
 	return listener.Addr().String()
-}
-
-func initStats() {
-	// TODO(drewbr) Implement OpenTelemetry stats
 }
 
 func initTracing() error {
@@ -220,21 +344,10 @@ func mustConnGRPC(ctx context.Context, conn **grpc.ClientConn, addr string) {
 	}
 }
 
-func readCatalogFile(catalog *pb.ListProductsResponse) error {
-	catalogMutex.Lock()
-	defer catalogMutex.Unlock()
-
-	catalogJSON, err := ioutil.ReadFile("products.json")
-	if err != nil {
-		log.Fatalf("failed to open product catalog json file: %v", err)
-		return err
+func createDatabase(pgdb *sql.DB, name string) error {
+	_, err := pgdb.Exec("SELECT 1 FROM pg_database WHERE datname=$1", name)
+	if err == sql.ErrNoRows {
+		_, err = pgdb.Exec(fmt.Sprintf("CREATE DATABASE %s;", name))
 	}
-	
-	if err := jsonpb.Unmarshal(bytes.NewReader(catalogJSON), catalog); err != nil {
-		log.Warnf("failed to parse the catalog JSON: %v", err)
-		return err
-	}
-
-	log.Info("successfully parsed product catalog json")
-	return nil
+	return err
 }
